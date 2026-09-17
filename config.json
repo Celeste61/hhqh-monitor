@@ -1,0 +1,47 @@
+{
+  "official": {
+    "enabled": true,
+    "game_id": "12000128",
+    "per_page": 30
+  },
+  "taptap": {
+    "enabled": true,
+    "group_id": 53899,
+    "app_id": 6968,
+    "only_official": true
+  },
+  "rss": {
+    "enabled": false,
+    "urls": []
+  },
+  "weibo": {
+    "enabled": false,
+    "uid": "5118618742",
+    "cookie": "",
+    "cookie_env": "WEIBO_COOKIE"
+  },
+  "push": {
+    "provider": "pushplus",
+    "token": "",
+    "token_env": "PUSH_TOKEN"
+  },
+  "filter": {
+    "exclude_keywords": [
+      "新服"
+    ],
+    "include_keywords": [
+      "更新",
+      "情报速递",
+      "活动",
+      "补偿",
+      "维护"
+    ]
+  },
+  "intervals": {
+    "official": 2,
+    "taptap": 5,
+    "weibo": 10,
+    "rss": 10
+  },
+  "state_keep": 400
+}
