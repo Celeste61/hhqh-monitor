@@ -2,7 +2,7 @@ name: 启航动态监控
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       args:
@@ -18,14 +18,14 @@ jobs:
   monitor:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
       - name: 恢复去重状态
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: state.json
           key: hhqh-state-${{ github.run_id }}
