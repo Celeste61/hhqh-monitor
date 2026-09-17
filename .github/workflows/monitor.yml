@@ -1,0 +1,40 @@
+name: 启航动态监控
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      args:
+        description: "可选参数：--test 测推送 / --force 强制补推 / 留空为正常巡检"
+        required: false
+        default: ""
+
+concurrency:
+  group: hhqh-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 恢复去重状态
+        uses: actions/cache@v4
+        with:
+          path: state.json
+          key: hhqh-state-${{ github.run_id }}
+          restore-keys: |
+            hhqh-state-
+
+      - name: 巡检并推送
+        env:
+          PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
+          WEIBO_COOKIE: ${{ secrets.WEIBO_COOKIE }}
+          PYTHONIOENCODING: utf-8
+        run: python hhqh_monitor.py ${{ github.event.inputs.args }}
