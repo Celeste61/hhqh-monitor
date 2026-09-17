@@ -34,6 +34,7 @@ BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 STATE_PATH = BASE_DIR / "state.json"
 TZ = timezone(timedelta(hours=8))
+VERSION = "1.3"
 
 # Windows 命令行默认是 GBK，遇到表情符号会报错，这里统一切到 UTF-8
 try:
@@ -93,6 +94,13 @@ DEFAULT_CONFIG = {
         "weibo": 10,
         "rss": 10,
     },
+    # 这些渠道"只推最新一条"：即使一次发现好几条新内容，也只推最新的那条
+    # 例如填 ["weibo"]，就只推微博最新一条动态
+    "only_latest": [],
+    # 允许抓取的时间窗口（本地时间，东八区）。不在窗口内就完全不发请求。
+    # 适合"只在特定时段更新"的渠道，能把请求量降到极低，减少风控风险。
+    # weekdays: 0=周一 1=周二 2=周三 3=周四 4=周五 5=周六 6=周日
+    "windows": {},
     "state_keep": 400,              # 每个渠道保留多少条历史指纹用于去重
 }
 
@@ -222,9 +230,8 @@ def fetch_weibo(cfg):
     cookie = (conf.get("cookie") or "").strip() or \
         os.environ.get(conf.get("cookie_env", "WEIBO_COOKIE"), "").strip()
     if not cookie:
-        log("跳过微博：config.json 的 weibo.cookie 和环境变量 %s 都是空的"
-            % conf.get("cookie_env", "WEIBO_COOKIE"))
-        return []
+        raise RuntimeError("没有配置微博 Cookie（config.json 的 weibo.cookie 或环境变量 %s）"
+                           % conf.get("cookie_env", "WEIBO_COOKIE"))
 
     uid = conf["uid"]
     headers = {
@@ -269,7 +276,7 @@ def fetch_weibo(cfg):
         log("微博手机接口也没拿到内容，Cookie 可能不完整或已过期")
     except Exception as exc:
         log("微博手机接口失败: %s" % exc)
-    return []
+    raise RuntimeError("微博接口没有返回任何内容，Cookie 可能已失效")
 
 
 def _weibo_title(raw):
@@ -445,15 +452,37 @@ def push(cfg, title, content):
 # --------------------------------------------------------------------------
 # 主流程
 # --------------------------------------------------------------------------
-def collect(cfg, state, force=False):
+def in_window(windows, now=None):
+    """判断当前时间是否落在任意一个允许的窗口里。
+    windows 形如 [{"weekdays": [3], "start": "15:30", "end": "19:00"}]"""
+    if not windows:
+        return True
+    now = now or datetime.now(TZ)
+    current = now.strftime("%H:%M")
+    for window in windows:
+        days = window.get("weekdays")
+        if days and now.weekday() not in days:
+            continue
+        if window.get("start", "00:00") <= current <= window.get("end", "23:59"):
+            return True
+    return False
+
+
+def collect(cfg, state, force=False, failures=None):
     """按各渠道自己的最小间隔决定这一轮要不要抓。"""
+    if failures is None:
+        failures = {}
     all_items = []
     intervals = cfg.get("intervals") or {}
+    windows = cfg.get("windows") or {}
     last_run = state.setdefault("last_run", {})
     now = int(time.time())
     for key, func in FETCHERS:
         conf = cfg.get(key, {})
         if not conf.get("enabled"):
+            continue
+        if not force and not in_window(windows.get(key)):
+            log("%s: 不在允许的时间窗口内，本轮跳过（不产生任何请求）" % key)
             continue
         every = int(intervals.get(key, 0) or 0) * 60
         previous = int(last_run.get(key, 0) or 0)
@@ -464,11 +493,50 @@ def collect(cfg, state, force=False):
         last_run[key] = now
         try:
             found = func(cfg)
+            for item in found:
+                item["channel"] = key
             log("%s: 抓到 %d 条" % (key, len(found)))
             all_items.extend(found)
         except Exception as exc:
             log("%s: 抓取出错 -> %s" % (key, exc))
+            failures[key] = str(exc)
     return all_items
+
+
+def maybe_alert(cfg, state, failures, cool_down_hours=72):
+    """某个渠道读不到内容时，主动推一条提醒（同一个渠道 72 小时内只提醒一次）。"""
+    if not failures:
+        return
+    alerts = state.setdefault("alerts", {})
+    now = int(time.time())
+    titles = {"weibo": "微博", "official": "官网", "taptap": "TapTap", "rss": "RSS"}
+    for key, err in failures.items():
+        if now - int(alerts.get(key, 0) or 0) < cool_down_hours * 3600:
+            continue
+        alerts[key] = now
+        name = titles.get(key, key)
+        push(cfg, "⚠️ 启航监控：%s 渠道读取失败" % name,
+             "<p>「%s」已经读不到内容了，报错是：</p>"
+             "<p><code>%s</code></p>"
+             "<p>微博渠道通常是 Cookie 过期，按 README 里的步骤换一次即可；"
+             "其他渠道请检查网络或配置。</p>" % (html.escape(name), html.escape(err)))
+
+
+def apply_only_latest(items, cfg):
+    """对配置里列出的渠道，只保留最新的一条。"""
+    channels = set(cfg.get("only_latest") or [])
+    if not channels:
+        return items
+    newest = {}
+    for item in items:
+        key = item.get("channel")
+        if key not in channels:
+            continue
+        if key not in newest or item["ts"] > newest[key]["ts"]:
+            newest[key] = item
+    keep = {id(v) for v in newest.values()}
+    return [item for item in items
+            if item.get("channel") not in channels or id(item) in keep]
 
 
 def apply_filter(items, cfg):
@@ -490,11 +558,15 @@ def apply_filter(items, cfg):
 
 def main():
     parser = argparse.ArgumentParser(description="航海王启航动态监控")
+    parser.add_argument("--version", action="version",
+                        version="hhqh_monitor %s" % VERSION)
     parser.add_argument("--dry-run", action="store_true", help="只打印，不推送、不写状态")
     parser.add_argument("--init", action="store_true", help="首次运行，只记录不推送")
     parser.add_argument("--test", action="store_true", help="发送一条测试推送")
     parser.add_argument("--test-weibo", action="store_true",
                         help="只测试微博通道，打印最近几条，不发推送")
+    parser.add_argument("--push-latest-weibo", action="store_true",
+                        help="立刻读取官方微博最新一条并推送到微信（不管渠道是否启用）")
     parser.add_argument("--force", action="store_true",
                         help="忽略历史状态，把当前最新内容全部推送一次")
     args = parser.parse_args()
@@ -502,24 +574,53 @@ def main():
     cfg = load_config()
 
     if args.test:
-        push(cfg, "启航监控测试消息",
-             "如果你在微信里看到这条消息，说明推送通道已经打通。")
-        return
+        ok = push(cfg, "启航监控测试消息",
+                  "如果你在微信里看到这条消息，说明推送通道已经打通。")
+        return 0 if ok else 1
 
     if args.test_weibo:
-        rows = fetch_weibo(cfg)
+        try:
+            rows = fetch_weibo(cfg)
+        except Exception as exc:
+            log("微博读取失败：%s" % exc)
+            rows = []
         if rows:
             print("微博通道正常，拿到 %d 条：" % len(rows))
             for item in rows[:5]:
                 print("  %s  %s" % (ts_to_str(item["ts"]), item["title"]))
         else:
             print("微博没有拿到内容，多半是 Cookie 不完整或已失效，往上翻看报错信息。")
-        return
+            return 1
+        return 0
+
+    if args.push_latest_weibo:
+        try:
+            rows = fetch_weibo(cfg)
+        except Exception as exc:
+            log("微博读取失败：%s" % exc)
+            return 1
+        if not rows:
+            log("没有读到微博内容，检查 Cookie 是否失效")
+            return
+        rows.sort(key=lambda x: x["ts"], reverse=True)
+        latest = rows[0]
+        title, content = build_message([latest])
+        if args.dry_run:
+            print("最新一条：%s  %s" % (ts_to_str(latest["ts"]), latest["title"]))
+            print("链接：%s" % latest["url"])
+            print("（dry-run，未推送）")
+            return 0
+        push(cfg, title, content)
+        log("已推送最新微博：%s" % latest["title"])
+        return 0
 
     state = load_state()
     first_run = not STATE_PATH.exists()
 
-    items = collect(cfg, state, force=args.force or args.dry_run)
+    failures = {}
+    items = collect(cfg, state, force=args.force or args.dry_run, failures=failures)
+    if not args.dry_run:
+        maybe_alert(cfg, state, failures)
     items = apply_filter(items, cfg)
     if not items:
         if not args.dry_run:
@@ -537,6 +638,7 @@ def main():
                 state["seen"][item["source"]].append(item["id"])
 
     new_items.sort(key=lambda x: x["ts"], reverse=True)
+    new_items = apply_only_latest(new_items, cfg)
 
     if args.dry_run:
         print("\n=== 本次可推送内容（dry-run，未发送、未写状态）===")
@@ -563,6 +665,6 @@ def main():
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main() or 0)
     except KeyboardInterrupt:
         sys.exit(130)
