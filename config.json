@@ -15,7 +15,7 @@
     "urls": []
   },
   "weibo": {
-    "enabled": false,
+    "enabled": true,
     "uid": "5118618742",
     "cookie": "",
     "cookie_env": "WEIBO_COOKIE"
@@ -40,8 +40,22 @@
   "intervals": {
     "official": 2,
     "taptap": 5,
-    "weibo": 10,
+    "weibo": 5,
     "rss": 10
+  },
+  "only_latest": [
+    "weibo"
+  ],
+  "windows": {
+    "weibo": [
+      {
+        "weekdays": [
+          3
+        ],
+        "start": "16:20",
+        "end": "18:00"
+      }
+    ]
   },
   "state_keep": 400
 }
