@@ -116,6 +116,11 @@
   .stat { display: flex; gap: 14px; align-items: baseline; margin-top: 6px; }
   .stat div { text-align: center; }
   .stat span { display: block; font-size: 12px; color: #7d8ba8; }
+  .status { font-size: 13px; padding: 8px 10px; border-radius: 8px; background: #16213a; color: #9fb4d8; }
+  .status.ok { background: #16301f; color: #8fe0a8; }
+  .status.err { background: #3a1c1c; color: #ff9f9f; }
+  .switch { display: flex; align-items: center; gap: 8px; }
+  .switch input { width: 20px; height: 20px; accent-color: #2f6bff; }
 </style>
 </head>
 <body>
@@ -181,6 +186,235 @@
   function persist() {
     try { localStorage.setItem(KEY, JSON.stringify(state)); }
     catch (e) { alert("保存失败，可能是浏览器存储被禁用。建议定期导出备份。"); }
+    scheduleUpload();
+  }
+
+  /* ---------------- 云端同步（把记录存到你自己的 GitHub 仓库） ---------------- */
+  var CFG_KEY = "hhqh_sync_cfg";
+  var syncCfg = loadSyncCfg();
+  var syncTimer = null;
+  var syncState = { text: "未配置云端", kind: "", at: 0 };
+  var justConfigured = false;   // 通过配置链接填好令牌时置位
+
+  function loadSyncCfg() {
+    try {
+      var c = JSON.parse(localStorage.getItem(CFG_KEY)) || {};
+      return {
+        owner: c.owner || "Celeste61",
+        repo: c.repo || "hhqh-monitor",
+        path: c.path || "battle-log/data.json",
+        token: c.token || "",
+        auto: c.auto !== false
+      };
+    } catch (e) {
+      return { owner: "Celeste61", repo: "hhqh-monitor", path: "battle-log/data.json", token: "", auto: true };
+    }
+  }
+  function saveSyncCfg() {
+    try { localStorage.setItem(CFG_KEY, JSON.stringify(syncCfg)); } catch (e) {}
+  }
+  /** 只要填了仓库位置就能读（读取不需要令牌，方便盟友查看）；
+   *  想上传才必须填令牌。 */
+  function canRead() { return !!(syncCfg.owner && syncCfg.repo && syncCfg.path); }
+  function canWrite() { return !!(canRead() && syncCfg.token); }
+  function syncReady() { return canWrite(); }
+  /** 盟友用的是带 ?view=1 的分享链接：只读看共享数据。
+   *  自己用普通链接打开，那就是正常的可编辑界面。 */
+  function viewerMode() {
+    if (/(^|[?&])view=1(&|$)/.test(location.search)) return true;
+    return location.hash.replace(/^#/, "") === "view";
+  }
+  function readOnly() { return viewerMode() && !canWrite(); }
+  function shareLink() {
+    return location.href.split("?")[0].split("#")[0] + "?view=1";
+  }
+  /** 手机配置链接：把仓库信息和令牌装进 # 后面（# 部分不会发给服务器），
+   *  打开后自动填好并立刻从地址栏抹掉。 */
+  function deviceLink() {
+    var payload = { o: syncCfg.owner, r: syncCfg.repo, p: syncCfg.path, t: syncCfg.token };
+    return location.href.split("?")[0].split("#")[0] + "#cfg=" + b64enc(JSON.stringify(payload));
+  }
+  function applyConfigFromHash() {
+    var h = location.hash.replace(/^#/, "");
+    if (h.indexOf("cfg=") !== 0) return false;
+    try {
+      var d = JSON.parse(b64dec(h.slice(4)));
+      if (!d.t) return false;
+      syncCfg.owner = d.o || syncCfg.owner;
+      syncCfg.repo = d.r || syncCfg.repo;
+      syncCfg.path = d.p || syncCfg.path;
+      syncCfg.token = d.t;
+      syncCfg.auto = true;
+      saveSyncCfg();
+      try { history.replaceState(null, "", location.pathname + location.search); } catch (e) {}
+      justConfigured = true;
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+  function setStatus(text, kind) {
+    syncState = { text: text, kind: kind || "", at: Date.now() };
+    if (view.name === "sync") render();
+  }
+  function b64enc(str) {
+    var bytes = new TextEncoder().encode(str);
+    var bin = "";
+    for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin);
+  }
+  function b64dec(b64) {
+    var bin = atob(String(b64).replace(/\s/g, ""));
+    var bytes = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new TextDecoder().decode(bytes);
+  }
+  function apiUrl() {
+    return "https://api.github.com/repos/" + syncCfg.owner + "/" + syncCfg.repo +
+      "/contents/" + syncCfg.path.split("/").map(encodeURIComponent).join("/");
+  }
+  function apiFetch(method, body) {
+    var headers = {
+      "Accept": "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "Content-Type": "application/json"
+    };
+    if (syncCfg.token) headers["Authorization"] = "Bearer " + syncCfg.token;
+    return fetch(apiUrl(), {
+      method: method,
+      headers: headers,
+      body: body ? JSON.stringify(body) : undefined
+    });
+  }
+  function cloudUpload(silent) {
+    if (!canWrite()) {
+      if (!silent) alert("你现在是「查看模式」，只能看不能传。\n想上传的话，需要在下面填入访问令牌。");
+      return;
+    }
+    setStatus("正在上传…");
+    var payload = JSON.stringify(state);
+    var sha = null;
+    apiFetch("GET").then(function (r) {
+      if (r.status === 200) return r.json().then(function (j) { sha = j.sha; });
+      if (r.status === 404) return null;
+      return r.json().then(function (j) { throw new Error(j.message || ("HTTP " + r.status)); });
+    }).then(function () {
+      var body = {
+        message: "更新盟战记录 " + new Date().toLocaleString("zh-CN"),
+        content: b64enc(payload)
+      };
+      if (sha) body.sha = sha;
+      return apiFetch("PUT", body).then(function (r) {
+        if (!r.ok) return r.json().then(function (j) { throw new Error(j.message || ("HTTP " + r.status)); });
+        return r.json();
+      });
+    }).then(function () {
+      setStatus("已上传到云端 · " + new Date().toLocaleTimeString("zh-CN"), "ok");
+    }).catch(function (e) {
+      setStatus("上传失败：" + e.message, "err");
+      if (!silent) alert("上传失败：" + e.message);
+    });
+  }
+  function cloudDownload(silent) {
+    if (!canRead()) { if (!silent) alert("先在下面填好仓库位置。"); return; }
+    setStatus("正在下载…");
+    apiFetch("GET").then(function (r) {
+      if (r.status === 404) throw new Error("云端还没有数据（先上传一次）");
+      if (!r.ok) return r.json().then(function (j) { throw new Error(j.message || ("HTTP " + r.status)); });
+      return r.json();
+    }).then(function (j) {
+      var data = JSON.parse(b64dec(j.content));
+      var m = migrate(data);
+      if (!m || !m.alliances) throw new Error("云端文件的格式不对");
+      if (!silent && !confirm("用云端的记录覆盖这台设备上的数据？\n（当前本机有 " + state.alliances.length +
+                              " 个盟，云端有 " + m.alliances.length + " 个盟）")) {
+        setStatus("已取消下载", "");
+        return;
+      }
+      state = m;
+      if (!state.suggestions) state.suggestions = emptySuggestions();
+      try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {}
+      renderDatalists();
+      if (view.name === "sync") { render(); } else { render(); }
+      setStatus("已从云端拉取 · " + new Date().toLocaleTimeString("zh-CN"), "ok");
+      if (!silent) alert("已同步：" + state.alliances.length + " 个盟。");
+    }).catch(function (e) {
+      setStatus("下载失败：" + e.message, "err");
+      if (!silent) alert("下载失败：" + e.message);
+    });
+  }
+  function scheduleUpload() {
+    if (!syncCfg.auto || !syncReady()) return;
+    if (syncTimer) clearTimeout(syncTimer);
+    syncTimer = setTimeout(function () { syncTimer = null; cloudUpload(true); }, 20000);
+  }
+
+  function newestAt(data) {
+    var t = 0;
+    (data.alliances || []).forEach(function (a) {
+      t = Math.max(t, a.updatedAt || 0);
+      (a.members || []).forEach(function (m) { t = Math.max(t, m.updatedAt || 0); });
+    });
+    return t;
+  }
+  /** 打开页面时的自动同步：本机没有数据就自动用云端的；
+   *  查看模式（没令牌）每次都拉最新的，方便盟友实时看到变化；
+   *  编辑模式两边都有数据时只提示，不擅自覆盖，避免误删。 */
+  function autoSyncOnLoad() {
+    if (!syncCfg.auto || !canRead()) return;
+    if (!viewerMode() && !canWrite()) return;   // 没配过、也不是查看链接：不打扰
+    apiFetch("GET").then(function (r) {
+      if (r.status === 404) { setStatus("云端还没有数据，改动后会自动上传", ""); return; }
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    }).then(function (j) {
+      if (!j) return;
+      var cloud = migrate(JSON.parse(b64dec(j.content)));
+      if (!cloud || !cloud.alliances) return;
+      if (viewerMode() && !canWrite()) {
+        // 查看模式：直接采用云端数据
+        state = cloud;
+        if (!state.suggestions) state.suggestions = emptySuggestions();
+        try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {}
+        renderDatalists(); render();
+        setStatus("查看模式 · 已载入共享数据 · " + new Date().toLocaleTimeString("zh-CN"), "ok");
+      } else if (!state.alliances.length && cloud.alliances.length) {
+        state = cloud;
+        try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {}
+        renderDatalists(); render();
+        setStatus("已从云端载入 " + cloud.alliances.length + " 个盟", "ok");
+      } else if (newestAt(cloud) > newestAt(state)) {
+        setStatus("云端记录比本机新（点「从云端下载」同步过来）", "");
+      } else {
+        setStatus("已与本机同步 · " + new Date().toLocaleTimeString("zh-CN"), "ok");
+      }
+    }).catch(function (e) {
+      setStatus("云端连接失败：" + e.message, "err");
+    });
+  }
+
+  /** 查看模式：每 2 分钟自动拉一次（GitHub 匿名接口限每小时 60 次，
+   *  2 分钟一次是 30 次/小时，还留了余量）；盟友手动刷新则是立刻生效。 */
+  function startViewerRefresh() {
+    if (!viewerMode() || !canRead() || canWrite() || !syncCfg.auto) return;
+    var tick = function () {
+      apiFetch("GET").then(function (r) { return r.ok ? r.json() : null; }).then(function (j) {
+        if (!j) return;
+        var cloud = migrate(JSON.parse(b64dec(j.content)));
+        if (cloud && cloud.alliances && JSON.stringify(cloud) !== JSON.stringify(state)) {
+          state = cloud;
+          if (!state.suggestions) state.suggestions = emptySuggestions();
+          try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {}
+          renderDatalists();
+          var y = window.scrollY; render(); window.scrollTo(0, y);
+          setStatus("已同步团长的最新记录 · " + new Date().toLocaleTimeString("zh-CN"), "ok");
+        }
+      }).catch(function () {});
+    };
+    setInterval(tick, 2 * 60 * 1000);
+    document.addEventListener("visibilitychange", function () {
+      if (!document.hidden) tick();      // 从后台切回来时立刻刷一次
+    });
   }
   function esc(s) {
     return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
@@ -210,9 +444,10 @@
     if (view.name === "alliances") {
       hdr.innerHTML = '<h1>盟战记录 <small>' + state.alliances.length + " 个盟</small></h1>" +
         '<div class="row"><input id="q" placeholder="搜索盟名或成员名…" value="' + esc(view.q) + '" autocomplete="off">' +
-        '<button class="primary" id="addAlliance">＋ 新盟</button></div>';
+        (readOnly() ? "" : '<button class="primary" id="addAlliance">＋ 新盟</button>') + "</div>";
       scr.innerHTML = renderAlliances();
-      bar.innerHTML = '<button class="ghost" id="ioBtn">导入 / 导出</button>';
+      bar.innerHTML = '<button class="ghost" id="syncBtn">☁ 云端</button>' +
+        '<button class="ghost" id="ioBtn">导入 / 导出</button>';
     } else if (view.name === "alliance") {
       var a = find(view.allianceId);
       if (!a) { view.name = "alliances"; return render(); }
@@ -221,31 +456,106 @@
       hdr.innerHTML = '<div class="crumb"><a id="back">← 全部盟</a></div>' +
         '<h1>' + esc(a.name || "(未命名盟)") + " <small>成员 " + a.members.length + " · 还剩 " + left + " / " + total + " 队未打</small></h1>" +
         '<div class="toolbar" style="margin:0">' +
-        '<button class="primary tiny" id="addMember">＋ 添加成员</button>' +
+        (readOnly() ? "" : '<button class="primary tiny" id="addMember">＋ 添加成员</button>') +
         '<button class="tiny" id="overviewBtn">未使用速览</button>' +
-        '<button class="tiny" id="resetBtn">全员重置</button>' +
-        '<button class="tiny" id="editAlliance">改盟名</button>' +
-        '<button class="tiny danger" id="delAlliance">删盟</button>' +
+        (readOnly() ? "" :
+          '<button class="tiny" id="resetBtn">全员重置</button>' +
+          '<button class="tiny" id="editAlliance">改盟名</button>' +
+          '<button class="tiny danger" id="delAlliance">删盟</button>') +
         "</div>";
       scr.innerHTML = renderAlliance(a);
-      bar.innerHTML = '<button class="ghost" id="ioBtn">导入 / 导出</button>';
+      bar.innerHTML = '<button class="ghost" id="syncBtn">☁ 云端</button>' +
+        '<button class="ghost" id="ioBtn">导入 / 导出</button>';
     } else if (view.name === "overview") {
       var a2 = find(view.allianceId);
       if (!a2) { view.name = "alliances"; return render(); }
       hdr.innerHTML = '<div class="crumb"><a id="backAlliance">← ' + esc(a2.name) + "</a></div>" +
         '<h1>未使用队伍速览 <small>按剩余数量排序</small></h1>';
       scr.innerHTML = renderOverview(a2);
-      bar.innerHTML = '<button class="ghost" id="ioBtn">导入 / 导出</button>';
+      bar.innerHTML = '<button class="ghost" id="syncBtn">☁ 云端</button>' +
+        '<button class="ghost" id="ioBtn">导入 / 导出</button>';
     } else if (view.name === "edit") {
       var a3 = find(view.allianceId);
       hdr.innerHTML = '<div class="crumb"><a id="cancel">← 返回' + esc(a3 ? a3.name : "") + "</a></div>" +
         "<h1>" + (draft.isNew ? "新增成员" : "编辑成员") + "</h1>";
       scr.innerHTML = renderEditor();
       bar.innerHTML = '<button class="ghost" id="cancel2">取消</button><button class="primary" id="saveBtn">保存</button>';
+    } else if (view.name === "sync") {
+      hdr.innerHTML = '<div class="crumb"><a id="syncBack">← 返回</a></div>' +
+        '<h1>云端同步 <small>把记录存到你自己的仓库</small></h1>';
+      scr.innerHTML = renderSync();
+      bar.innerHTML = '<button class="ghost" id="syncDown">⬇ 从云端下载</button>' +
+        '<button class="primary" id="syncUp">⬆ 上传到云端</button>';
     }
   }
 
+  function renderSync() {
+    var st = syncState.text;
+    var cls = syncState.kind ? " " + syncState.kind : "";
+    var mode = !canRead() ? "未配置" : (canWrite() ? "可编辑（能上传）" : "查看模式（只读）");
+    return '<div class="status' + cls + '">' + esc(st) + "</div>" +
+      '<div class="card" style="margin-top:10px"><b>当前身份：' + esc(mode) + "</b>" +
+      '<div class="muted" style="margin-top:4px">' +
+      (canWrite()
+        ? "你填了令牌，可以上传记录——改动会自动同步给所有打开这个网址的人。"
+        : "只要仓库位置对，任何人都能查看共享记录；想上传才需要填令牌。") +
+      "</div></div>" +
+      '<div class="card" style="margin-top:10px">' +
+      '<div class="field"><label class="muted">仓库（owner/仓库名）</label>' +
+      '<input id="cfgRepo" value="' + esc(syncCfg.owner + "/" + syncCfg.repo) + '" placeholder="Celeste61/hhqh-monitor" autocomplete="off"></div>' +
+      '<div class="field"><label class="muted">文件路径</label>' +
+      '<input id="cfgPath" value="' + esc(syncCfg.path) + '" placeholder="battle-log/data.json" autocomplete="off"></div>' +
+      '<div class="field"><label class="muted">访问令牌（GitHub Token）</label>' +
+      '<input id="cfgToken" type="password" value="' + esc(syncCfg.token) + '" placeholder="github_pat_..." autocomplete="off"></div>' +
+      '<div class="field switch"><input type="checkbox" id="cfgAuto"' + (syncCfg.auto ? " checked" : "") +
+      '><label class="muted" for="cfgAuto">自动同步（打开时拉取，改动后自动上传）</label></div>' +
+      '<div class="toolbar" style="margin:12px 0 0"><button id="syncSave">保存设置</button></div>' +
+      "</div>" +
+      '<div class="card"><b>分享给盟友</b><div class="muted" style="margin-top:6px;line-height:1.7">' +
+      "把下面这个网址发到群里就行，他们打开<b>不用填任何东西</b>，会自动看到你上传的记录，每 5 分钟刷新一次。" +
+      "注意结尾的 <code>?view=1</code> 是只读模式；你自己要用<b>不带这个后缀</b>的网址，才能编辑和上传。" +
+      '</div><div class="row" style="margin-top:8px"><input id="shareUrl" readonly value="' +
+      esc(shareLink()) + '"><button class="tiny" id="copyUrl">复制</button></div></div>' +
+      (canWrite()
+        ? '<div class="card"><b>给自己手机用（一键配置）</b><div class="muted" style="margin-top:6px;line-height:1.7">' +
+          "手机上填令牌很麻烦，用下面这条链接代替：发到自己的微信（文件传输助手），手机上点开，" +
+          "<b>令牌会自动填好</b>，之后手机就能直接编辑和上传。" +
+          "链接用 <code>#</code> 传递，不会发送给服务器，打开后也会自动从地址栏消失。" +
+          '<br><b style="color:#ffc46b">⚠ 这条链接等于密码，只发给自己，别发到群里。</b>' +
+          '</div><div class="row" style="margin-top:8px"><input id="deviceUrl" readonly value="' +
+          esc(deviceLink()) + '"><button class="tiny" id="copyDevice">复制</button></div></div>'
+        : "") +
+      '<div class="card"><b>怎么拿到令牌</b><div class="muted" style="margin-top:6px;line-height:1.7">' +
+      "1. GitHub 右上头像 → Settings → Developer settings → Personal access tokens → <b>Fine-grained tokens</b><br>" +
+      "2. Generate new token，Expiration 选最长<br>" +
+      "3. Repository access 选 <b>Only select repositories</b>，只勾这一个仓库<br>" +
+      "4. Permissions → Repository permissions → <b>Contents</b> 设为 <b>Read and write</b><br>" +
+      "5. 生成后复制，粘到上面那栏" +
+      "</div></div>" +
+      '<div class="card"><b>两点提醒</b><div class="muted" style="margin-top:6px;line-height:1.7">' +
+      "· 用公开仓库的话，知道这个网址的人都能看到记录——按你的需求就该这样<br>" +
+      "· 导出的 JSON 备份里<b>不含</b>这个令牌，可以放心分享" +
+      "</div></div>";
+  }
+
   function renderAlliances() {
+    var banner = "";
+    if (justConfigured) {
+      banner += '<div class="card" style="border-color:#2f6bff55;background:#16301f">' +
+        '<b>✅ 配置完成</b><div class="muted" style="margin-top:4px">' +
+        "这台设备的令牌已经自动填好了，现在可以直接修改并上传同步。" +
+        "</div></div>";
+    }
+    if (readOnly()) {
+      banner = '<div class="card" style="border-color:#2f6bff44;background:#152341">' +
+        '<b>👀 查看模式</b><div class="muted" style="margin-top:4px">' +
+        "这里显示的是团长上传的共享记录" +
+        (syncState.at ? "，数据更新于 " + new Date(syncState.at).toLocaleTimeString("zh-CN") : "") +
+        "，每 2 分钟自动刷新。<br>" +
+        "<b>想立刻看最新的，下拉刷新页面就行</b>——打开页面那一刻就会去拉数据。<br>" +
+        "想自己维护一份，点底部「☁ 云端」填入令牌即可。" +
+        "</div></div>";
+    }
     var q = (view.q || "").trim();
     if (q) {   // 搜索模式：跨盟搜成员
       var hits = [];
@@ -253,8 +563,8 @@
         if ((a.name || "").indexOf(q) >= 0) hits.push({ alliance: a, member: null });
         a.members.forEach(function (m) { if ((m.name || "").indexOf(q) >= 0) hits.push({ alliance: a, member: m }); });
       });
-      if (!hits.length) return '<div class="empty">没找到「' + esc(q) + "」</div>";
-      return hits.map(function (h) {
+      if (!hits.length) return banner + '<div class="empty">没找到「' + esc(q) + "」</div>";
+      return banner + hits.map(function (h) {
         if (!h.member) return '<div class="card"><h3>盟：' + esc(h.alliance.name) + "</h3>" +
           '<div class="muted">' + h.alliance.members.length + ' 个成员</div>' +
           '<div class="toolbar" style="margin:8px 0 0"><button data-act="openAlliance" data-id="' + h.alliance.id + '">打开</button></div></div>';
@@ -266,9 +576,9 @@
       }).join("");
     }
     if (!state.alliances.length) {
-      return '<div class="empty">还没有盟。点右上角「＋ 新盟」建一个，<br>比如「XX盟」，再把对面助力成员加进去。</div>';
+      return banner + '<div class="empty">还没有盟。点右上角「＋ 新盟」建一个，<br>比如「XX盟」，再把对面助力成员加进去。</div>';
     }
-    return state.alliances.map(function (a) {
+    return banner + state.alliances.map(function (a) {
       var total = 0, left = 0, revived = 0;
       a.members.forEach(function (m) {
         total += (m.teams || []).length;
@@ -332,7 +642,8 @@
         return '<div class="team-block' + (t.used ? " used" : "") + '">' +
           '<div class="team-head-line">' +
           '<label><input type="checkbox" data-act="toggleUsed" data-a="' + a.id + '" data-m="' + m.id +
-          '" data-t="' + ti + '"' + (t.used ? " checked" : "") + ">" + esc(t.label) + "</label>" +
+          '" data-t="' + ti + '"' + (t.used ? " checked" : "") + (readOnly() ? " disabled" : "") + ">" +
+          esc(t.label) + "</label>" +
           '<span class="tag' + (t.used ? " done" : " left") + '">' + (t.used ? "已使用" : "未使用") + "</span>" +
           '<span class="muted">' + chars.length + " 人</span>" +
           "</div>" +
@@ -347,11 +658,12 @@
         "</h3>" +
         (m.note ? '<div class="muted">' + esc(m.note) + "</div>" : "") +
         (lines || '<div class="muted">还没有记录队伍</div>') +
-        '<div class="toolbar" style="margin:8px 0 0">' +
-        '<button class="tiny" data-act="editMember" data-a="' + a.id + '" data-id="' + m.id + '">编辑配置</button>' +
-        '<button class="tiny" data-act="resetMember" data-a="' + a.id + '" data-id="' + m.id + '">重置此人</button>' +
-        '<button class="tiny danger" data-act="delMember" data-a="' + a.id + '" data-id="' + m.id + '">删除</button>' +
-        "</div></div>";
+        (readOnly() ? "" :
+          '<div class="toolbar" style="margin:8px 0 0">' +
+          '<button class="tiny" data-act="editMember" data-a="' + a.id + '" data-id="' + m.id + '">编辑配置</button>' +
+          '<button class="tiny" data-act="resetMember" data-a="' + a.id + '" data-id="' + m.id + '">重置此人</button>' +
+          '<button class="tiny danger" data-act="delMember" data-a="' + a.id + '" data-id="' + m.id + '">删除</button>' +
+          "</div>") + "</div>";
     }).join("");
   }
 
@@ -579,6 +891,63 @@
       render(); return;
     }
     if (id === "ioBtn") { ioMenu(); return; }
+    if (id === "syncBtn") {
+      view.prev = { name: view.name, allianceId: view.allianceId };
+      view.name = "sync";
+      render(); return;
+    }
+    if (id === "syncBack") {
+      var p = view.prev || { name: "alliances", allianceId: "" };
+      view.name = p.name || "alliances";
+      view.allianceId = p.allianceId || "";
+      render(); return;
+    }
+    if (id === "syncSave") {
+      var raw = document.getElementById("cfgRepo").value.trim().replace(/^https?:\/\/github\.com\//, "");
+      var parts = raw.split("/").filter(function (x) { return x; });
+      if (parts.length < 2) { alert("仓库要写成 owner/仓库名，例如 Celeste61/hhqh-monitor"); return; }
+      syncCfg.owner = parts[0];
+      syncCfg.repo = parts[1];
+      syncCfg.path = document.getElementById("cfgPath").value.trim() || "data.json";
+      syncCfg.token = document.getElementById("cfgToken").value.trim();
+      syncCfg.auto = document.getElementById("cfgAuto").checked;
+      saveSyncCfg();
+      setStatus(syncReady() ? "设置已保存" + (syncCfg.auto ? "，已开启自动同步" : "") : "设置已保存，但还没填令牌", "ok");
+      return;
+    }
+    if (id === "syncUp") { cloudUpload(false); return; }
+    if (id === "syncDown") { cloudDownload(false); return; }
+    if (id === "copyUrl") {
+      var box = document.getElementById("shareUrl");
+      box.select();
+      box.setSelectionRange(0, 999);
+      try {
+        navigator.clipboard.writeText(box.value).then(function () {
+          setStatus("分享网址已复制，发到群里即可", "ok");
+        }).catch(function () {
+          document.execCommand("copy");
+          setStatus("分享网址已复制，发到群里即可", "ok");
+        });
+      } catch (e) {
+        document.execCommand("copy");
+        setStatus("分享网址已复制，发到群里即可", "ok");
+      }
+      return;
+    }
+    if (id === "copyDevice") {
+      var dbox = document.getElementById("deviceUrl");
+      dbox.select();
+      dbox.setSelectionRange(0, 9999);
+      var done = function () { setStatus("手机配置链接已复制 —— 发给自己，别发群里", "ok"); };
+      try {
+        navigator.clipboard.writeText(dbox.value).then(done).catch(function () {
+          document.execCommand("copy"); done();
+        });
+      } catch (e) {
+        document.execCommand("copy"); done();
+      }
+      return;
+    }
     if (id === "overviewBtn") { view.name = "overview"; render(); return; }
     if (id === "addMember") { draft = newMember(); draft.isNew = true; view.name = "edit"; render(); return; }
     if (id === "addTeamBtn") {
@@ -706,6 +1075,12 @@
   }
   renderDatalists();
   render();
+  if (applyConfigFromHash()) {
+    render();
+    setStatus("令牌已通过链接自动填好，这台设备现在可以编辑和上传", "ok");
+  }
+  autoSyncOnLoad();
+  startViewerRefresh();
 })();
 </script>
 </body>
